@@ -1,0 +1,312 @@
+#include <opencv2/opencv.hpp>
+
+#include "GxIAPI.h"
+#include "DxImageProc.h"
+
+#include <spdlog/spdlog.h>
+
+#include <chrono>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <vector>
+
+namespace {
+
+// 错误码转描述字符串
+std::string GetErrorString(GX_STATUS emErrorStatus) {
+    char *error_info = nullptr;
+    size_t size = 0;
+    GX_STATUS emStatus = GXGetLastError(&emErrorStatus, nullptr, &size);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        return "<Error when calling GXGetLastError>";
+    }
+    error_info = new char[size];
+    emStatus = GXGetLastError(&emErrorStatus, error_info, &size);
+    std::string error_string = error_info != nullptr ? error_info : "";
+    delete[] error_info;
+    return emStatus == GX_STATUS_SUCCESS ? error_string : "<Error when calling GXGetLastError>";
+}
+
+struct DeviceInfo {
+    std::string serial;
+    std::string model;
+};
+
+std::vector<DeviceInfo> EnumerateDevices() {
+    uint32_t device_num = 0;
+    GX_STATUS emStatus = GXUpdateAllDeviceList(&device_num, 1000);
+    if (emStatus != GX_STATUS_SUCCESS || device_num == 0) {
+        spdlog::error("枚举失败或未找到设备: {}", GetErrorString(emStatus));
+        spdlog::error("请检查: 1) 相机上电 2) USB3.0 口 3) 设备权限");
+        return {};
+    }
+
+    std::vector<DeviceInfo> devices;
+    spdlog::info("共找到 {} 台设备:", device_num);
+    for (uint32_t i = 1; i <= device_num; ++i) {
+        GX_DEVICE_INFO info;
+        memset(&info, 0, sizeof(GX_DEVICE_INFO));
+        emStatus = GXGetDeviceInfo(i, &info);
+        if (emStatus != GX_STATUS_SUCCESS) {
+            continue;
+        }
+        if (info.emDevType == GX_DEVICE_CLASS_U3V) {
+            auto &u3v = info.DevInfo.stU3VDevInfo;
+            spdlog::info("[{}] 型号: {}  序列号: {}", i,
+                         reinterpret_cast<const char *>(u3v.chModelName),
+                         reinterpret_cast<const char *>(u3v.chSerialNumber));
+            devices.push_back({reinterpret_cast<const char *>(u3v.chSerialNumber),
+                               reinterpret_cast<const char *>(u3v.chModelName)});
+        }
+    }
+    return devices;
+}
+
+int FindDeviceIndexBySerial(const std::vector<DeviceInfo> &devices, const std::string &serial) {
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (devices[i].serial == serial) {
+            return static_cast<int>(i) + 1;
+        }
+    }
+    return -1;
+}
+
+bool AddExposureTime(GX_DEV_HANDLE device, double delta_us) {
+    GX_FLOAT_VALUE node;
+    memset(&node, 0, sizeof(GX_FLOAT_VALUE));
+    GX_STATUS emStatus = GXGetFloatValue(device, "ExposureTime", &node);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("Get ExposureTime: {}", GetErrorString(emStatus));
+        return false;
+    }
+
+    double value = node.dCurValue + delta_us;
+    value = value < 1.0 ? 1.0 : (value > 10000.0 ? 10000.0 : value);
+
+    emStatus = GXSetFloatValue(device, "ExposureTime", value);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("Set ExposureTime: {}", GetErrorString(emStatus));
+        return false;
+    }
+    spdlog::info("曝光时间 -> {} us", value);
+    return true;
+}
+
+bool AddGain(GX_DEV_HANDLE device, double delta_db) {
+    GX_FLOAT_VALUE node;
+    memset(&node, 0, sizeof(GX_FLOAT_VALUE));
+    GX_STATUS emStatus = GXGetFloatValue(device, "Gain", &node);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("Get Gain: {}", GetErrorString(emStatus));
+        return false;
+    }
+
+    double value = node.dCurValue + delta_db;
+    value = value < 0.0 ? 0.0 : (value > 32.0 ? 32.0 : value);
+
+    emStatus = GXSetFloatValue(device, "Gain", value);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("Set Gain: {}", GetErrorString(emStatus));
+        return false;
+    }
+    spdlog::info("增益 -> {} dB", value);
+    return true;
+}
+
+bool AddGamma(GX_DEV_HANDLE device, double delta) {
+    GX_FLOAT_VALUE node;
+    memset(&node, 0, sizeof(GX_FLOAT_VALUE));
+    GX_STATUS emStatus = GXGetFloatValue(device, "Gamma", &node);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("Get Gamma: {}", GetErrorString(emStatus));
+        return false;
+    }
+
+    double value = node.dCurValue + delta;
+    value = value < 0.1 ? 0.1 : (value > 3.0 ? 3.0 : value);
+
+    emStatus = GXSetFloatValue(device, "Gamma", value);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("Set Gamma: {}", GetErrorString(emStatus));
+        return false;
+    }
+    spdlog::info("伽马 -> {}", value);
+    return true;
+}
+
+} // namespace
+
+int main(int argc, char *argv[]) {
+    GX_STATUS emStatus = GXInitLib();
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("GXInitLib 失败: {}", GetErrorString(emStatus));
+        return -1;
+    }
+
+    auto devices = EnumerateDevices();
+    if (devices.empty()) {
+        GXCloseLib();
+        return -1;
+    }
+    if (argc < 2) {
+        spdlog::info("用法: ./daheng_demo <相机序列号>");
+        GXCloseLib();
+        return 0;
+    }
+    const std::string serial = argv[1];
+
+    int device_index = FindDeviceIndexBySerial(devices, serial);
+    if (device_index < 0) {
+        spdlog::error("序列号 {} 不在枚举列表中!", serial);
+        GXCloseLib();
+        return -1;
+    }
+
+    GX_DEV_HANDLE device = nullptr;
+    emStatus = GXOpenDeviceByIndex(device_index, &device);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("GXOpenDeviceByIndex: {}", GetErrorString(emStatus));
+        GXCloseLib();
+        return -1;
+    }
+    spdlog::info("打开相机 {} 成功", serial);
+
+    // 自动挡全关
+    GXSetEnumValueByString(device, "ExposureAuto", "Off");
+    GXSetEnumValueByString(device, "GainAuto", "Off");
+    GXSetEnumValueByString(device, "BalanceWhiteAuto", "Continuous");
+
+    // 连续采集 + 关触发
+    emStatus = GXSetEnumValueByString(device, "AcquisitionMode", "Continuous");
+    if (emStatus != GX_STATUS_SUCCESS) spdlog::error("AcquisitionMode: {}", GetErrorString(emStatus));
+    emStatus = GXSetEnumValueByString(device, "TriggerMode", "Off");
+    if (emStatus != GX_STATUS_SUCCESS) spdlog::error("TriggerMode: {}", GetErrorString(emStatus));
+
+    // 像素格式
+    emStatus = GXSetEnumValue(device, "PixelFormat", GX_PIXEL_FORMAT_BAYER_RG8);
+    if (emStatus != GX_STATUS_SUCCESS) spdlog::error("PixelFormat: {}", GetErrorString(emStatus));
+
+    // 解除 USB3 限速
+    GX_INT_VALUE limit_node;
+    memset(&limit_node, 0, sizeof(GX_INT_VALUE));
+    if (GXGetIntValue(device, "DeviceLinkThroughputLimit", &limit_node) == GX_STATUS_SUCCESS) {
+        emStatus = GXSetIntValue(device, "DeviceLinkThroughputLimit", limit_node.nMax);
+        if (emStatus != GX_STATUS_SUCCESS)
+            spdlog::error("DeviceLinkThroughputLimit: {}", GetErrorString(emStatus));
+    }
+
+    // 读分辨率
+    GX_INT_VALUE width_node, height_node;
+    memset(&width_node, 0, sizeof(GX_INT_VALUE));
+    memset(&height_node, 0, sizeof(GX_INT_VALUE));
+    GXGetIntValue(device, "Width", &width_node);
+    GXGetIntValue(device, "Height", &height_node);
+    int width = static_cast<int>(width_node.nCurValue);
+    int height = static_cast<int>(height_node.nCurValue);
+    spdlog::info("分辨率 {}x{}", width, height);
+
+    // 获取流
+    uint32_t stream_num = 0;
+    GX_DS_HANDLE stream_handle = nullptr;
+    if (GXGetDataStreamNumFromDev(device, &stream_num) != GX_STATUS_SUCCESS || stream_num < 1) {
+        spdlog::error("获取数据流失败");
+        GXCloseDevice(device);
+        GXCloseLib();
+        return -1;
+    }
+    GXGetDataStreamHandleFromDev(device, 1, &stream_handle);
+    uint32_t payload_size = 0;
+    GXGetPayLoadSize(stream_handle, &payload_size);
+
+    // 缓存 + 转换缓冲区
+    GXSetAcqusitionBufferNumber(device, 5);
+    const unsigned int buffer_size = sizeof(unsigned char) * width * height * 3;
+    unsigned char *rgb_buffer = static_cast<unsigned char *>(malloc(buffer_size));
+
+    // Bayer 滤镜排列
+    int64_t color_filter = GX_COLOR_FILTER_NONE;
+    GX_ENUM_VALUE filter_value;
+    memset(&filter_value, 0, sizeof(GX_ENUM_VALUE));
+    if (GXGetEnumValue(device, "PixelColorFilter", &filter_value) == GX_STATUS_SUCCESS) {
+        color_filter = filter_value.stCurValue.nCurValue;
+    }
+
+    // 开始取流
+    emStatus = GXStreamOn(device);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        spdlog::error("GXStreamOn: {}", GetErrorString(emStatus));
+        free(rgb_buffer);
+        GXCloseDevice(device);
+        GXCloseLib();
+        return -1;
+    }
+
+    int frame_count = 0;
+    auto fps_window_start = std::chrono::steady_clock::now();
+    double fps = 0.0;
+
+    PGX_FRAME_BUFFER frame_buffer = nullptr;
+    spdlog::info("取流开始，按 e/d 调曝光、a/q 调增益、s/w 调伽马、ESC 退出");
+
+    while (true) {
+        emStatus = GXDQBuf(device, &frame_buffer, 1000);
+        if (emStatus != GX_STATUS_SUCCESS) {
+            spdlog::error("GXDQBuf 超时/失败: {}", GetErrorString(emStatus));
+            break;
+        }
+
+        if (frame_buffer->nStatus != GX_FRAME_STATUS_SUCCESS) {
+            spdlog::warn("帧状态异常: 0x{:x}", frame_buffer->nStatus);
+            GXQBuf(device, frame_buffer);
+            continue;
+        }
+
+        VxInt32 dx_status = DxRaw8toRGB24Ex(frame_buffer->pImgBuf, rgb_buffer,
+                                            frame_buffer->nWidth, frame_buffer->nHeight,
+                                            RAW2RGB_NEIGHBOUR, DX_PIXEL_COLOR_FILTER(color_filter),
+                                            false, DX_ORDER_BGR);
+        if (dx_status != DX_OK) {
+            spdlog::error("DxRaw8toRGB24Ex 失败: 0x{:x}", dx_status);
+            GXQBuf(device, frame_buffer);
+            continue;
+        }
+
+        cv::Mat image(frame_buffer->nHeight, frame_buffer->nWidth, CV_8UC3, rgb_buffer);
+        cv::Mat display = image.clone();
+
+        ++frame_count;
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - fps_window_start).count();
+        if (elapsed >= 1.0) {
+            fps = frame_count / elapsed;
+            frame_count = 0;
+            fps_window_start = now;
+        }
+        cv::putText(display, "FPS: " + std::to_string(fps), cv::Point(10, 30),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+        cv::imshow("daheng_demo", display);
+
+        bool quit = false;
+        switch (cv::waitKey(1)) {
+            case 27: quit = true; break;
+            case 'e': AddExposureTime(device, 25.0); break;
+            case 'd': AddExposureTime(device, -25.0); break;
+            case 'a': AddGain(device, 0.1); break;
+            case 'q': AddGain(device, -0.1); break;
+            case 's': AddGamma(device, 0.1); break;
+            case 'w': AddGamma(device, -0.1); break;
+            default: break;
+        }
+
+        GXQBuf(device, frame_buffer);
+        if (quit) break;
+    }
+
+    GXStreamOff(device);
+    free(rgb_buffer);
+    GXCloseDevice(device);
+    GXCloseLib();
+    spdlog::info("相机已关闭");
+    return 0;
+}
