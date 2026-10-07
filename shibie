@@ -1,0 +1,772 @@
+// =====================================================================
+// 大恒工业相机 + 装甲板颜色识别 Demo (基于作业文档 2.2.8 节修改)
+//
+
+//
+// 按键: e/d 调曝光  a/q 调增益  s/w 调伽马  ESC 退出
+// =====================================================================
+
+#include <GxIAPI.h>
+#include <DxImageProc.h>
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <string>
+#include <vector>
+
+// ================= 时间平滑用的全局状态 =================
+// 每一块"正在跟"的装甲板存一份四角点，用于给框做指数平滑(EMA)抑制抖动，
+// 并在短暂丢帧时按上一次的形状续画。
+struct TrackedArmor {
+    cv::Point2f corners[4]; // 左上, 右上, 右下, 左下
+    int lost_frames;        // 连续多少帧没再检测到它
+};
+
+std::vector<TrackedArmor> g_tracks;          // 当前跟踪中的装甲板
+const int MAX_LOST_FRAMES = 10;              // 丢多少帧后彻底放弃(约 0.2 秒)
+const float SMOOTH_ALPHA = 0.6f;             // EMA 中"新观测"的权重，越大越跟手
+const float MATCH_DIST = 150.0f;             // 新旧装甲板中心距离小于它才算同一块
+
+// 一根候选灯条：除了 RotatedRect 本身，还预先算好沿主轴的两个端点。
+// 端点必须沿"主轴方向"取，不能按 Y 坐标排序取——灯条倾斜超过 45° 时，
+// Y 最小的两个角点其实是灯条的侧边而不是上端边。
+struct LightBar {
+    cv::RotatedRect rect;
+    cv::Point2f top;    // 主轴两端中 y 较小的那个
+    cv::Point2f bottom; // 主轴两端中 y 较大的那个
+    cv::Point2f dir;    // 主轴单位方向向量(由 top 指向 bottom)
+    float length;       // 主轴长度(灯条长度)
+};
+
+struct ArmorCandidate {
+    int left_idx;  // 左侧灯条在 light_bars 中的下标
+    int right_idx; // 右侧灯条在 light_bars 中的下标
+    float score;   // 打分，越小越好
+    cv::Point2f corners[4];
+};
+
+struct DeviceInfo {
+    std::string serial;
+    std::string model;
+    int index; // 该设备在 SDK 里的 1-based 序号，打开设备时要用它
+};
+
+// 获取错误信息辅助函数
+std::string GetErrorString(GX_STATUS emErrorStatus) {
+    size_t size = 0;
+    GX_STATUS emStatus = GXGetLastError(&emErrorStatus, nullptr, &size); // 第一次:只取长度
+    if (emStatus != GX_STATUS_SUCCESS || size == 0) {
+        return "<Error when calling GXGetLastError>";
+    }
+    std::vector<char> error_info(size);
+    emStatus = GXGetLastError(&emErrorStatus, error_info.data(), &size); // 第二次:取内容
+    if (emStatus != GX_STATUS_SUCCESS) {
+        return "<Error when calling GXGetLastError>";
+    }
+    return std::string(error_info.data()); // 内容以 '\0' 结尾，直接当 C 字符串用
+}
+
+// 枚举设备
+std::vector<DeviceInfo> EnumerateDevices() {
+    uint32_t device_num = 0;
+    // 第二个参数是枚举超时(ms):GigE 相机响应慢，官方建议至少 1000
+    GX_STATUS emStatus = GXUpdateAllDeviceList(&device_num, 1000);
+    if (emStatus != GX_STATUS_SUCCESS || device_num == 0) {
+        std::cout << "枚举失败或未找到设备：" << GetErrorString(emStatus) << std::endl
+                  << "请检查：1）相机上电 2）USB3.0 口 3）设备权限" << std::endl;
+        return {};
+    }
+    std::vector<DeviceInfo> devices;
+    std::cout << "共找到 " << device_num << " 台设备:" << std::endl;
+    for (uint32_t i = 1; i <= device_num; ++i) { // 序号从 1 开始!
+        GX_DEVICE_INFO info;
+        memset(&info, 0, sizeof(GX_DEVICE_INFO));
+        emStatus = GXGetDeviceInfo(i, &info);
+        if (emStatus != GX_STATUS_SUCCESS) continue;
+        // 本项目只支持 USB3 相机(U3V)；GigE 相机序列号在 stGigEDevInfo 里
+        if (info.emDevType == GX_DEVICE_CLASS_U3V) {
+            auto& u3v = info.DevInfo.stU3VDevInfo;
+            std::cout << "[" << i << "] 型号: " << reinterpret_cast<const char*>(u3v.chModelName)
+                      << " 序列号: " << reinterpret_cast<const char*>(u3v.chSerialNumber) << std::endl;
+            // 注意:把 SDK 的真实序号 i 存下来。devices 里只留了 U3V 设备，
+            // 数组下标和 SDK 序号在混有 GigE 设备时并不相等。
+            devices.push_back({reinterpret_cast<const char*>(u3v.chSerialNumber),
+                               reinterpret_cast<const char*>(u3v.chModelName),
+                               static_cast<int>(i)});
+        }
+    }
+    return devices;
+}
+
+// 查找设备序号(返回 SDK 的 1-based 序号，找不到返回 -1)
+int FindDeviceIndexBySerial(const std::vector<DeviceInfo>& devices, const std::string& serial) {
+    for (const auto& device : devices) {
+        if (device.serial == serial) {
+            return device.index;
+        }
+    }
+    return -1;
+}
+
+// 把一个浮点节点的值加上 delta 并写回，自动按该节点自己的上下限钳位。
+// 不写死 1~10000 / 0~32 这类范围，换机型也不用改代码。
+bool AdjustFloatNode(GX_DEV_HANDLE device, const char* node_name, double delta, const char* unit) {
+    GX_FLOAT_VALUE node;
+    memset(&node, 0, sizeof(GX_FLOAT_VALUE));
+    GX_STATUS emStatus = GXGetFloatValue(device, node_name, &node);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        std::cout << "Get " << node_name << ": " << GetErrorString(emStatus) << std::endl;
+        return false;
+    }
+    double value = node.dCurValue + delta;
+    value = value < node.dMin ? node.dMin : (value > node.dMax ? node.dMax : value);
+    emStatus = GXSetFloatValue(device, node_name, value);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        std::cout << "Set " << node_name << ": " << GetErrorString(emStatus) << std::endl;
+        return false;
+    }
+    std::cout << node_name << " -> " << value << " " << unit
+              << "  (范围 " << node.dMin << " ~ " << node.dMax << ")" << std::endl;
+    return true;
+}
+
+// 调整曝光时间
+bool AddExposureTime(GX_DEV_HANDLE device, double delta_us) {
+    return AdjustFloatNode(device, "ExposureTime", delta_us, "us");
+}
+
+// 调整增益
+bool AddGain(GX_DEV_HANDLE device, double delta_db) {
+    return AdjustFloatNode(device, "Gain", delta_db, "dB");
+}
+
+// 调整伽马
+bool AddGamma(GX_DEV_HANDLE device, double delta) {
+    return AdjustFloatNode(device, "Gamma", delta, "");
+}
+
+// ================= 装甲板颜色识别函数（作业核心） =================
+
+// 求 RotatedRect 的主轴两端点。
+// 分两步:
+//   1) 取相邻两条边中较长的那条，它的方向就是主轴方向。
+//      这里必须用"相邻边"，不能取"四角中距离最远的一对"——最远的一对是对角线
+//      (长 60 宽 12 的灯条，对角线 61.2 > 长边 60)，方向和长度都会算偏。
+//   2) 端点取"端边中点"，也就是中心沿主轴方向加减半个长度。
+//      注意不能直接用角点：角点偏离轴线半个灯条宽度(实测约 6px)，会让框整体外扩。
+// points() 返回的四个角点是按顺序绕一圈的，所以 pts[1]-pts[0] 和 pts[2]-pts[1]
+// 一定是相邻的两条边，且长边短边交替。这样写也不依赖 OpenCV 的 angle 取值范围约定。
+void GetBarEndpoints(const cv::RotatedRect& rect, cv::Point2f& top, cv::Point2f& bottom, float& length) {
+    cv::Point2f pts[4];
+    rect.points(pts);
+    const float len01 = cv::norm(pts[1] - pts[0]);
+    const float len12 = cv::norm(pts[2] - pts[1]);
+
+    cv::Point2f dir;
+    if (len01 >= len12) {
+        if (len01 < 1e-6f) { // 退化成一个点，无从谈方向
+            top = rect.center;
+            bottom = rect.center;
+            length = 0.0f;
+            return;
+        }
+        length = len01;
+        dir = (pts[1] - pts[0]) / len01;
+    } else {
+        length = len12;
+        dir = (pts[2] - pts[1]) / len12;
+    }
+
+    const cv::Point2f p0 = rect.center - dir * (length * 0.5f);
+    const cv::Point2f p1 = rect.center + dir * (length * 0.5f);
+    if (p0.y <= p1.y) {
+        top = p0;
+        bottom = p1;
+    } else {
+        top = p1;
+        bottom = p0;
+    }
+}
+
+cv::Point2f ArmorCenter(const cv::Point2f corners[4]) {
+    return (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25f;
+}
+
+// 四个角点围出的轴对齐外接框面积
+float ArmorBoxArea(const cv::Point2f corners[4]) {
+    float min_x = corners[0].x, max_x = corners[0].x;
+    float min_y = corners[0].y, max_y = corners[0].y;
+    for (int k = 1; k < 4; ++k) {
+        min_x = std::min(min_x, corners[k].x);
+        max_x = std::max(max_x, corners[k].x);
+        min_y = std::min(min_y, corners[k].y);
+        max_y = std::max(max_y, corners[k].y);
+    }
+    return (max_x - min_x) * (max_y - min_y);
+}
+
+// 由两根灯条拼出装甲板的四个角点(顺序:左上, 右上, 右下, 左下)
+void BuildArmorCorners(const LightBar& bar1, const LightBar& bar2, cv::Point2f corners[4]) {
+    // 按 x 坐标决定谁在左谁在右，避免配对顺序影响角点顺序
+    const LightBar& left = bar1.rect.center.x <= bar2.rect.center.x ? bar1 : bar2;
+    const LightBar& right = bar1.rect.center.x <= bar2.rect.center.x ? bar2 : bar1;
+    corners[0] = left.top;    // 左灯条上端
+    corners[1] = right.top;   // 右灯条上端
+    corners[2] = right.bottom; // 右灯条下端
+    corners[3] = left.bottom;  // 左灯条下端
+}
+
+// 检查一对灯条能否组成装甲板，能则输出角点和打分(越小越像真的)
+bool TryPairArmor(const LightBar& bar1, const LightBar& bar2, float& score, cv::Point2f corners[4]) {
+    const cv::Point2f c1 = bar1.rect.center;
+    const cv::Point2f c2 = bar2.rect.center;
+
+    // 约束1：两根灯条长度差 < 50%
+    float len_min = std::min(bar1.length, bar2.length);
+    float len_max = std::max(bar1.length, bar2.length);
+    if (len_max < 1.0f) return false;
+    float len_diff = (len_max - len_min) / len_max;
+    if (len_diff > 0.5f) return false;
+
+    // 约束2：中心距离只保留一个防除零的下限。
+    // 原来写死的 30~600 像素是按"远处小目标"定的，近处拍到的装甲板
+    // 两灯条间距 700+ 像素，会被整条丢掉。距离实际上已经被下面
+    // 约束6的"间距/灯条长"比值卡住了，不需要再用绝对像素数重复限制。
+    float dist = cv::norm(c1 - c2);
+    if (dist < 1.0f) return false;
+
+    // 约束3(已删除)：原来是"高度差 < 80 像素"。
+    // 这条是冗余的——约束5要求两灯条中心连线垂直于灯条主轴，
+    // 本身就隐含 y_diff <= 0.5*dist；单独再卡一个 80px 只会
+    // 额外引入"装甲板必须正立"的假设(镜头有侧倾、或板子横放就失效)，
+    // 而且同样不随距离缩放。
+
+    // 约束4：两根灯条的主轴方向大致平行(夹角 < 45°)。
+    // 这里比较方向向量而不是 RotatedRect::angle——后者的取值范围([0,90))和
+    // 长宽谁大谁小有关，直接相减会误判。取 |点积| 是为了忽略朝向 180° 的差别。
+    float dir_dot = std::abs(bar1.dir.x * bar2.dir.x + bar1.dir.y * bar2.dir.y);
+    dir_dot = std::min(1.0f, std::max(0.0f, dir_dot));
+    float angle_between = std::acos(dir_dot); // 弧度
+    if (angle_between > 45.0f * static_cast<float>(CV_PI) / 180.0f) return false;
+
+    // 约束5：两灯条中心的连线应当大致垂直于灯条主轴。
+    // 这一条是整套约束里最关键的一条：它同时保证了
+    //   "两根灯条是并排的，而不是上下堆叠的"、
+    //   "不是两块装甲板之间斜着连的"，
+    // 而且完全是尺度无关的。约束3删除后，正立性由它来兜底。
+    cv::Point2f center_dir = (c2 - c1) / dist; // 已归一化
+    float perp_dot = std::abs(center_dir.x * bar1.dir.x + center_dir.y * bar1.dir.y);
+    if (perp_dot > 0.5f) return false; // 偏离垂直超过 60° 就不要
+
+    // 约束6：装甲板的宽(两灯条间距) / 高(灯条长) 落在合理区间。
+    // 小装甲模块实测 135mm 宽 / 50mm 左右灯条，这个比值约 2~3，
+    // 透视拉长也不会超过 6。
+    float avg_len = (bar1.length + bar2.length) * 0.5f;
+    float aspect = dist / std::max(avg_len, 1.0f);
+    if (aspect < 1.0f || aspect > 6.0f) return false;
+
+    BuildArmorCorners(bar1, bar2, corners);
+
+    // 打分：长度越接近、方向越平行、越垂直，分数越低。
+    // 最后一项 aspect*0.05 是个小权重，专门用来打破并列——
+    // 两块装甲板并排时，"真配对"和"跨装甲板的错配对"其它项可能完全相同
+    // (实测两者长度、角度都一致)，不加这一项的话 std::sort 的不稳定性
+    // 会让贪心选到错的那对。用 aspect 而不是像素距离，是为了保持尺度无关。
+    score = len_diff * 2.0f + angle_between * 2.0f + perp_dot + aspect * 0.05f;
+    return true;
+}
+
+// 输入：BGR 彩色图
+// 输出：画出灯条外框和装甲板四角点的图像
+cv::Mat detectArmor(const cv::Mat& src) {
+    cv::Mat result = src.clone();
+
+    // 1. 转 HSV 色彩空间
+    cv::Mat hsv;
+    cv::cvtColor(src, hsv, cv::COLOR_BGR2HSV);
+
+    // 2. 颜色阈值分割（提取红色和蓝色）
+    cv::Mat mask_red1, mask_red2, mask_red, mask_blue, mask;
+
+    // 红色范围（低 H 值和高 H 值，因为红色跨越 0 和 180）
+    cv::inRange(hsv, cv::Scalar(0, 100, 100), cv::Scalar(10, 255, 255), mask_red1);
+    cv::inRange(hsv, cv::Scalar(160, 100, 100), cv::Scalar(180, 255, 255), mask_red2);
+    cv::bitwise_or(mask_red1, mask_red2, mask_red);
+
+    // 蓝色范围
+    cv::inRange(hsv, cv::Scalar(100, 100, 100), cv::Scalar(124, 255, 255), mask_blue);
+
+    // 将红色和蓝色合并（这里你可以选择只留红色或蓝色，看你要打哪种装甲板）
+    cv::bitwise_or(mask_red, mask_blue, mask);
+    
+
+    // 3. 形态学去噪（开闭运算让灯条更完整，消除小噪点）
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+
+    // 4. 查找轮廓
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    // 5. 筛选灯条
+    // 尺寸限制用"相对图像大小的比例"来表示，而不是写死像素值。
+    // 灯条成像大小随距离变化极大：拿实测照片量一下，同一块装甲板近处拍
+    // 灯条长 406px、远处只有几十 px，相差十几倍。原来写死的"面积 10~2000、
+    // 长度 10~400"只对某一个距离成立——近处拍的照片里灯条全部被丢掉
+    // (实测左灯条 406x58、凸度 0.98、长宽比 7.0，形状完美，却因为面积
+    //  21242 > 2000 被扔)。改成比例后远近都能用。
+    const double img_area = static_cast<double>(src.cols) * src.rows;
+    const double min_area = img_area * 5.0e-6; // 1920x1200 下约 11.5
+    const double max_area = img_area * 5.0e-2; // 1920x1200 下约 115200
+    const float min_len = src.rows * 0.008f;   // 1200 下约 9.6
+    const float max_len = src.rows * 0.55f;    // 1200 下约 660
+
+    std::vector<LightBar> light_bars;
+    for (const auto& contour : contours) {
+        double area = cv::contourArea(contour);
+        // 面积上下限（只挡住噪点和横跨半屏的粘连团块）
+        if (area < min_area || area > max_area) continue;
+
+        cv::RotatedRect rect = cv::minAreaRect(contour);
+        LightBar bar;
+        bar.rect = rect;
+        GetBarEndpoints(rect, bar.top, bar.bottom, bar.length);
+        float width = std::max(rect.size.width, rect.size.height);
+        float height = std::min(rect.size.width, rect.size.height);
+        if (height < 1.0f) continue;
+
+        // 长宽比（与尺度无关，是区分"细长灯条"和"圆团块"的主力）
+        float ratio = width / height;
+        if (ratio < 2.0f || ratio > 15.0f) continue;
+
+        // 长度上下限
+        if (bar.length < min_len || bar.length > max_len) continue;
+
+        // 凸度过滤：面积/外接凸包面积
+        std::vector<cv::Point> hull;
+        cv::convexHull(contour, hull);
+        double hull_area = cv::contourArea(hull);
+        if (hull_area < 1) continue;
+        if (area / hull_area < 0.5) continue; // 凸度放宽到 0.5
+
+        // 主轴方向(由 top 指向 bottom)，长度已保证 > 0
+        bar.dir = (bar.bottom - bar.top) / bar.length;
+        light_bars.push_back(bar);
+    }
+
+    // 6. 配对装甲板：先收集所有合法配对并打分，再贪心选取。
+    //    直接"所有配对都画"会出现同一块装甲板被反复画、两块装甲板的灯条互相交叉画的问题。
+    // 装甲板本身还要够大：杂波背景里的小噪点也能两两凑出"平行 + 中心连线垂直"
+    // 的合法几何，单靠形状约束挡不住。实测真装甲板占画面 17%~28%，
+    // 这类假配对只占 0.01%~0.035%，两者差约 500 倍，用一条下限就能干净分开。
+    // 0.001 也仍然兼容"远处小目标"：原来那套阈值对应的目标约占画面 0.3%，
+    // 在安全范围内。想把探测距离放得更远，就调小这个数。
+    const float min_armor_area = static_cast<float>(img_area) * 0.001f;
+
+    std::vector<ArmorCandidate> candidates;
+    for (size_t i = 0; i < light_bars.size(); ++i) {
+        for (size_t j = i + 1; j < light_bars.size(); ++j) {
+            ArmorCandidate cand;
+            cand.score = 0.0f;
+            if (!TryPairArmor(light_bars[i], light_bars[j], cand.score, cand.corners)) continue;
+            if (ArmorBoxArea(cand.corners) < min_armor_area) continue;
+            cand.left_idx = static_cast<int>(i);
+            cand.right_idx = static_cast<int>(j);
+            candidates.push_back(cand);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const ArmorCandidate& a, const ArmorCandidate& b) { return a.score < b.score; });
+
+    // 贪心：分数低的配对优先成立，一根灯条最多属于一块装甲板
+    std::vector<bool> bar_used(light_bars.size(), false);
+    std::vector<cv::Point2f> detected_corners; // 本帧新检测到的装甲板(每块 4 个点)
+    for (const auto& cand : candidates) {
+        if (bar_used[cand.left_idx] || bar_used[cand.right_idx]) continue;
+        bar_used[cand.left_idx] = true;
+        bar_used[cand.right_idx] = true;
+        for (int k = 0; k < 4; ++k) detected_corners.push_back(cand.corners[k]);
+    }
+
+    // 7. 更新跟踪状态：本帧的观测与已有轨迹按中心距离配对并做 EMA 平滑
+    const size_t num_detected = detected_corners.size() / 4;
+    const size_t old_track_count = g_tracks.size(); // 下面会往 g_tracks 里加新轨迹，先记下旧的数量
+    std::vector<bool> track_matched(old_track_count, false);
+    std::vector<bool> det_matched(num_detected, false);
+
+    for (size_t d = 0; d < num_detected; ++d) {
+        const cv::Point2f* det = &detected_corners[d * 4];
+        cv::Point2f det_center = ArmorCenter(det);
+        int best_track = -1;
+        float best_dist = MATCH_DIST;
+        for (size_t t = 0; t < old_track_count; ++t) {
+            if (track_matched[t]) continue;
+            float dist = cv::norm(ArmorCenter(g_tracks[t].corners) - det_center);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_track = static_cast<int>(t);
+            }
+        }
+        if (best_track >= 0) {
+            // 找到同一块装甲板：把新观测平滑进旧轨迹
+            TrackedArmor& track = g_tracks[best_track];
+            for (int k = 0; k < 4; ++k) {
+                track.corners[k] = SMOOTH_ALPHA * det[k] + (1.0f - SMOOTH_ALPHA) * track.corners[k];
+            }
+            track.lost_frames = 0;
+            track_matched[best_track] = true;
+            det_matched[d] = true;
+        }
+    }
+    // 没匹配上任何旧轨迹的观测 → 新建一条轨迹
+    for (size_t d = 0; d < num_detected; ++d) {
+        if (det_matched[d]) continue;
+        TrackedArmor track;
+        for (int k = 0; k < 4; ++k) track.corners[k] = detected_corners[d * 4 + k];
+        track.lost_frames = 0;
+        g_tracks.push_back(track);
+    }
+    // 本帧没被任何观测匹配的旧轨迹 → 记一次丢失，超时就删掉。
+    // 只遍历旧轨迹：刚 push 进去的新轨迹本轮显然是被观测到的，不该计丢失。
+    for (size_t t = 0; t < old_track_count; ++t) {
+        if (track_matched[t]) continue;
+        g_tracks[t].lost_frames++;
+    }
+    g_tracks.erase(std::remove_if(g_tracks.begin(), g_tracks.end(),
+                                  [](const TrackedArmor& t) { return t.lost_frames > MAX_LOST_FRAMES; }),
+                   g_tracks.end());
+
+    // 8. 绘制：本帧命中的轨迹画蓝色框 + 黄色角点；只是续画的轨迹画橙色框
+    for (const auto& track : g_tracks) {
+        if (track.lost_frames == 0) {
+            for (int k = 0; k < 4; ++k) {
+                cv::line(result, track.corners[k], track.corners[(k + 1) % 4], cv::Scalar(255, 0, 0), 3);
+            }
+            for (int k = 0; k < 4; ++k) {
+                cv::circle(result, track.corners[k], 6, cv::Scalar(0, 255, 255), -1);
+            }
+        } else {
+            for (int k = 0; k < 4; ++k) {
+                cv::line(result, track.corners[k], track.corners[(k + 1) % 4], cv::Scalar(0, 165, 255), 2);
+            }
+            cv::putText(result, "TRACKING", cv::Point(static_cast<int>(track.corners[0].x), static_cast<int>(track.corners[0].y) - 10),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 165, 255), 2);
+        }
+    }
+
+    // 9. 把单个灯条也画出来（绿色细框，方便调试）
+    for (const auto& bar : light_bars) {
+        cv::Point2f vertices[4];
+        bar.rect.points(vertices);
+        for (int i = 0; i < 4; ++i) {
+            cv::line(result, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 0), 2);
+        }
+    }
+
+    return result;
+}
+
+// 【新增】断流重连：相机偶发掉线后，把流停掉再开一次，多数情况能自愈。
+// 每一步都"先打印、再调用"——如果某一步本身卡住了（设备已从 USB 上消失时，
+// GXStreamOff 可能一直等一个永远完不成的 USB 传输），这些打印就能立刻告诉我们
+// 卡在哪一步，而不是只看到窗口不动、完全不知道程序停在哪。
+bool RestartStream(GX_DEV_HANDLE device) {
+    std::cout << "  停止取流 GXStreamOff ..." << std::flush;
+    GX_STATUS status = GXStreamOff(device);
+    std::cout << " 返回 " << status << std::endl;
+    if (status != GX_STATUS_SUCCESS) return false;
+
+    std::cout << "  重新开始取流 GXStreamOn ..." << std::flush;
+    status = GXStreamOn(device);
+    std::cout << " 返回 " << status << std::endl;
+    return status == GX_STATUS_SUCCESS;
+}
+
+// ================= 主函数 =================
+int main(int argc, char* argv[]) {
+    GX_STATUS emStatus = GXInitLib();
+    if (emStatus != GX_STATUS_SUCCESS) {
+        std::cout << "GXInitLib 失败: " << GetErrorString(emStatus) << std::endl;
+        return 1;
+    }
+    std::cout << "GXInitLib status = " << emStatus << std::endl;
+
+    auto devices = EnumerateDevices();
+    if (devices.empty()) {
+        GXCloseLib();
+        return 1;
+    }
+
+    if (argc < 2) {
+        std::cout << "用法: ./armor_detection <相机序列号>" << std::endl;
+        GXCloseLib();
+        return 1;
+    }
+
+    const std::string serial = argv[1];
+    int device_index = FindDeviceIndexBySerial(devices, serial);
+    if (device_index < 0) {
+        std::cout << "serial not found" << std::endl;
+        GXCloseLib();
+        return 1;
+    }
+
+    GX_DEV_HANDLE device = nullptr;
+    emStatus = GXOpenDeviceByIndex(device_index, &device);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        std::cout << "GXOpenDeviceByIndex: " << GetErrorString(emStatus) << std::endl;
+        GXCloseLib();
+        return -1;
+    }
+    std::cout << "打开相机 " << serial << " 成功" << std::endl;
+
+    // ===== 配置相机 =====
+    GXSetEnumValueByString(device, "ExposureAuto", "Off");
+    GXSetEnumValueByString(device, "GainAuto", "Off");
+    GXSetEnumValueByString(device, "BalanceWhiteAuto", "Continuous");
+
+    emStatus = GXSetEnumValueByString(device, "AcquisitionMode", "Continuous");
+    if (emStatus != GX_STATUS_SUCCESS) std::cout << "AcquisitionMode: " << GetErrorString(emStatus) << std::endl;
+    emStatus = GXSetEnumValueByString(device, "TriggerMode", "Off");
+    if (emStatus != GX_STATUS_SUCCESS) std::cout << "TriggerMode: " << GetErrorString(emStatus) << std::endl;
+
+    emStatus = GXSetEnumValue(device, "PixelFormat", GX_PIXEL_FORMAT_BAYER_RG8);
+    if (emStatus != GX_STATUS_SUCCESS) std::cout << "PixelFormat: " << GetErrorString(emStatus) << std::endl;
+
+    // 【已改】不再把链路限速解到最大。
+    // 原来这里是 limit_node.nMax（解除限速），等于让相机贴着 USB3 带宽上限跑。
+    // 内核日志显示这条链路本来就不稳（全天 130+ 条复位/掉线记录，每次撑 3~9 分钟
+    // 就 reset SuperSpeed USB device → USB disconnect），而满载正是压垮边缘链路
+    // 最典型的诱因。识别演示 30fps 已经绰绰有余，没必要跑满。
+    const int64_t kThroughputLimit = 200 * 1000 * 1000; // 200 MB/s
+    GX_INT_VALUE limit_node;
+    memset(&limit_node, 0, sizeof(GX_INT_VALUE));
+    if (GXGetIntValue(device, "DeviceLinkThroughputLimit", &limit_node) == GX_STATUS_SUCCESS) {
+        int64_t v = std::min(std::max(kThroughputLimit, limit_node.nMin), limit_node.nMax);
+        emStatus = GXSetIntValue(device, "DeviceLinkThroughputLimit", v);
+        if (emStatus != GX_STATUS_SUCCESS)
+            std::cout << "DeviceLinkThroughputLimit: " << GetErrorString(emStatus) << std::endl;
+        else
+            std::cout << "链路限速 " << v / 1000000 << " MB/s（相机上限 "
+                      << limit_node.nMax / 1000000 << " MB/s）" << std::endl;
+    }
+
+    // 【新增】限帧。不设上限的话，相机会按曝光允许的最高帧率出图（曝光 5ms 时
+    // 可达 200fps），采集端根本消化不掉，白白把带宽和功耗吃满。
+    const double kTargetFps = 30.0; // 想更高就改这里
+    if (GXSetBoolValue(device, "AcquisitionFrameRateEnable", true) == GX_STATUS_SUCCESS) {
+        emStatus = GXSetFloatValue(device, "AcquisitionFrameRate", kTargetFps);
+        if (emStatus != GX_STATUS_SUCCESS)
+            std::cout << "AcquisitionFrameRate: " << GetErrorString(emStatus) << std::endl;
+        else
+            std::cout << "帧率上限 " << kTargetFps << " fps" << std::endl;
+    } else {
+        std::cout << "本型号不支持 AcquisitionFrameRateEnable，跳过限帧" << std::endl;
+    }
+
+    // 读分辨率（要在设置 PixelFormat 之后读，分辨率会随格式变化）
+    GX_INT_VALUE width_node, height_node;
+    memset(&width_node, 0, sizeof(GX_INT_VALUE));
+    memset(&height_node, 0, sizeof(GX_INT_VALUE));
+    GXGetIntValue(device, "Width", &width_node);
+    GXGetIntValue(device, "Height", &height_node);
+    int width = static_cast<int>(width_node.nCurValue);
+    int height = static_cast<int>(height_node.nCurValue);
+    std::cout << "分辨率 " << width << "x" << height << std::endl;
+
+    // 大恒的"流"概念：payload(单帧字节数)要从数据流句柄查询
+    uint32_t stream_num = 0;
+    GX_DS_HANDLE stream_handle = nullptr;
+    if (GXGetDataStreamNumFromDev(device, &stream_num) != GX_STATUS_SUCCESS || stream_num < 1) {
+        std::cout << "获取数据流失败" << std::endl;
+        GXCloseDevice(device);
+        GXCloseLib();
+        return -1;
+    }
+    GXGetDataStreamHandleFromDev(device, 1, &stream_handle);
+    uint32_t payload_size = 0;
+    GXGetPayLoadSize(stream_handle, &payload_size);
+
+    // 设置 SDK 内部取流缓存个数(5 个)。
+    // 注意函数名里的 "Acqusition" 是 SDK 自带的拼写，写对了反而编译不过。
+    emStatus = GXSetAcqusitionBufferNumber(device, 5);
+    if (emStatus != GX_STATUS_SUCCESS)
+        std::cout << "GXSetAcqusitionBufferNumber: " << GetErrorString(emStatus) << std::endl;
+
+    // 转换缓冲区：按 Bayer(单通道) → BGR24(三通道) 估算，之后每帧再按实际 nImgSize 校正。
+    size_t rgb_buffer_size = static_cast<size_t>(payload_size) * 3;
+    if (rgb_buffer_size == 0) rgb_buffer_size = static_cast<size_t>(width) * height * 3;
+    unsigned char* rgb_buffer = static_cast<unsigned char*>(malloc(rgb_buffer_size));
+    if (rgb_buffer == nullptr) {
+        std::cout << "分配转换缓冲区失败" << std::endl;
+        GXCloseDevice(device);
+        GXCloseLib();
+        return -1;
+    }
+
+    int64_t color_filter = GX_COLOR_FILTER_NONE;
+    GX_ENUM_VALUE filter_value;
+    memset(&filter_value, 0, sizeof(GX_ENUM_VALUE));
+    if (GXGetEnumValue(device, "PixelColorFilter", &filter_value) == GX_STATUS_SUCCESS) {
+        color_filter = filter_value.stCurValue.nCurValue;
+    }
+
+    emStatus = GXStreamOn(device);
+    if (emStatus != GX_STATUS_SUCCESS) {
+        std::cout << "GXStreamOn: " << GetErrorString(emStatus) << std::endl;
+        free(rgb_buffer);
+        GXCloseDevice(device);
+        GXCloseLib();
+        return -1;
+    }
+
+    // ===== 循环取帧、识别、显示 =====
+    int frame_count = 0;
+    auto fps_window_start = std::chrono::steady_clock::now();
+    double fps = 0.0;
+    PGX_FRAME_BUFFER frame_buffer = nullptr;
+    std::cout << "取流开始，按 e/d 调曝光、a/q 调增益、s/w 调伽马、ESC 退出" << std::endl;
+
+    // 【已改】取帧失败不再一律当致命错误。
+    // 官方示例(GxAcquireSoftTrigger)对 GX_STATUS_TIMEOUT 的处理就是 continue 继续取，
+    // 而原来这里任何非成功都直接 break，紧接着就走关闭流程 —— 相机掉线时，
+    // 关闭流程本身会卡在驱动里等一个永远完不成的 USB 传输，表现出来就是
+    // "窗口不动、ESC 没反应"的卡死。现在改成：偶发超时继续跑，
+    // 连续失败到 MAX_CONSECUTIVE_FAILS 次才认定掉线，先尝试断流重连，
+    // 重连也失败才退出；而且每一步都有打印，卡在哪一步一眼可见。
+    const int MAX_CONSECUTIVE_FAILS = 5;
+    int consecutive_fails = 0;
+    int bad_frame_total = 0;
+
+    while (true) {
+        // 1000ms 超时取一帧（DQ = DeQueue，从 SDK 队列取出一帧）
+        emStatus = GXDQBuf(device, &frame_buffer, 1000);
+        if (emStatus != GX_STATUS_SUCCESS) {
+            ++consecutive_fails;
+            // 偶尔抖一下是正常的，别刷屏：前 3 次和之后每 10 次打印一条
+            if (consecutive_fails <= 3 || consecutive_fails % 10 == 0) {
+                std::cout << "GXDQBuf " << (emStatus == GX_STATUS_TIMEOUT ? "超时" : "失败")
+                          << "（连续 " << consecutive_fails << " 次）: "
+                          << GetErrorString(emStatus) << std::endl;
+            }
+            if (consecutive_fails >= MAX_CONSECUTIVE_FAILS) {
+                std::cout << "连续 " << consecutive_fails
+                          << " 次取不到帧，疑似相机掉线，尝试断流重连" << std::endl;
+                if (!RestartStream(device)) {
+                    std::cout << "重连失败 —— 相机可能已从 USB 上掉线，退出" << std::endl;
+                    break;
+                }
+                std::cout << "重连成功，继续取流" << std::endl;
+                consecutive_fails = 0;
+            }
+            continue;
+        }
+        consecutive_fails = 0; // 取到帧就清零
+
+        // 帧状态检查：丢包、传输错误的帧要跳过，但必须照常 QB 还回去
+        if (frame_buffer->nStatus != GX_FRAME_STATUS_SUCCESS) {
+            ++bad_frame_total;
+            // 链路变差时坏帧可能是连续的，同样限制打印频率，避免刷屏拖慢主循环
+            if (bad_frame_total <= 3 || bad_frame_total % 100 == 0) {
+                std::cout << "帧状态异常（累计 " << bad_frame_total << " 帧）: 0x"
+                          << std::hex << frame_buffer->nStatus << std::dec << std::endl;
+            }
+            GXQBuf(device, frame_buffer); // 无论帧好坏都要还，否则队列会被掏空
+            continue;
+        }
+
+        // 按本帧实际数据量确保转换缓冲区够大。
+        // nImgSize 是单通道原始数据字节数，转成 BGR24 需要 3 倍。
+        // 用帧自己的 nWidth/nHeight/nImgSize，而不是启动时读到的分辨率——
+        // 分辨率或 ROI 变了才不会写越界。
+        size_t frame_raw_size = static_cast<size_t>(frame_buffer->nImgSize);
+        size_t frame_pixels = static_cast<size_t>(frame_buffer->nWidth) * frame_buffer->nHeight;
+        size_t need_size = std::max(frame_raw_size, frame_pixels) * 3;
+        if (need_size > rgb_buffer_size) {
+            unsigned char* new_buffer = static_cast<unsigned char*>(realloc(rgb_buffer, need_size));
+            if (new_buffer == nullptr) {
+                std::cout << "扩展转换缓冲区失败，跳过该帧" << std::endl;
+                GXQBuf(device, frame_buffer);
+                continue;
+            }
+            rgb_buffer = new_buffer;
+            rgb_buffer_size = need_size;
+        }
+
+        // Bayer RG8 -> BGR24。参数含义:
+        //   RAW2RGB_NEIGHBOUR   邻域插值(简单快速)
+        //   DX_PIXEL_COLOR_FILTER(滤镜排列) 由 PixelColorFilter 节点查询得到
+        //   false                不翻转图像
+        //   DX_ORDER_BGR         输出 OpenCV 的 BGR 通道序
+        // 帧的尺寸要在归还之前读出来存好：GXQBuf 之后这块内存归 SDK 所有，
+        // 可能马上被下一帧覆写，再去读 frame_buffer-> 就是访问已释放的数据。
+        const int frame_w = frame_buffer->nWidth;
+        const int frame_h = frame_buffer->nHeight;
+
+        VxInt32 dx_status = DxRaw8toRGB24Ex(
+            frame_buffer->pImgBuf, rgb_buffer, frame_w, frame_h,
+            RAW2RGB_NEIGHBOUR, DX_PIXEL_COLOR_FILTER(color_filter), false, DX_ORDER_BGR);
+
+        if (dx_status != DX_OK) {
+            std::cout << "DxRaw8toRGB24Ex 失败: 0x" << std::hex << dx_status << std::dec << std::endl;
+            GXQBuf(device, frame_buffer); // 同样要还
+            continue;
+        }
+
+        // 转换完成的像素已在自有 rgb_buffer 里，SDK 那帧没用了，立刻还回去。
+        // 内部缓存只有 5 帧，拿着帧做完整检测+显示会白白丢帧（漏还/迟还的最终症状
+        // 就是队列被掏空、GXDQBuf 一直超时、帧率掉到 0）。
+        GXQBuf(device, frame_buffer);
+
+        // rgb_buffer 要到下一帧转换时才会被覆写，这里包成 Mat 直接用，不必额外拷贝
+        cv::Mat image(frame_h, frame_w, CV_8UC3, rgb_buffer);
+
+        // ===== 核心: 调用识别函数 =====
+        cv::Mat display = detectArmor(image); // 这里返回的是画了框的图
+
+        ++frame_count;
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - fps_window_start).count();
+        if (elapsed >= 1.0) {
+            fps = frame_count / elapsed;
+            frame_count = 0;
+            fps_window_start = now;
+        }
+
+        // 在图像上画 FPS
+        cv::putText(display, "FPS: " + std::to_string(fps), cv::Point(10, 30),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+
+        cv::imshow("Armor Detection", display);
+
+        // ===== 按键处理 =====
+        int key = cv::waitKey(1);
+        if (key == 27) break; // ESC 退出
+        else if (key == 'e') AddExposureTime(device, 25.0);   // 增大曝光
+        else if (key == 'd') AddExposureTime(device, -25.0);  // 减小曝光
+        else if (key == 'a') AddGain(device, 0.5);            // 增大增益
+        else if (key == 'q') AddGain(device, -0.5);           // 减小增益
+        else if (key == 's') AddGamma(device, 0.1);           // 增大伽马
+        else if (key == 'w') AddGamma(device, -0.1);          // 减小伽马
+    }
+
+    // 逆序关闭：停流 -> 释放缓冲 -> 关设备 -> 关库（与 InitLib 配对）。
+    // 【已改】每一步都先打印再调用：相机若已掉线，GXStreamOff/GXCloseDevice
+    // 有可能卡在驱动里，有这些打印就能立刻看出是哪一步卡住的。
+    std::cout << "正在停止取流 GXStreamOff ..." << std::flush;
+    GXStreamOff(device);
+    std::cout << " 完成" << std::endl;
+    free(rgb_buffer);
+    std::cout << "正在关闭设备 GXCloseDevice ..." << std::flush;
+    GXCloseDevice(device);
+    std::cout << " 完成" << std::endl;
+    std::cout << "正在关闭 SDK GXCloseLib ..." << std::flush;
+    GXCloseLib();
+    std::cout << " 完成" << std::endl;
+    cv::destroyAllWindows();
+    std::cout << "相机已关闭" << std::endl;
+    return 0;
+}
